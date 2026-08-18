@@ -6,8 +6,9 @@ import streamlit as st
 from io import StringIO
 import csv
 from datetime import datetime
+import requests
+from bs4 import BeautifulSoup
 
-from fetcher import Fetcher
 from extractor import get_extractor, FacultyRecord
 
 st.set_page_config(
@@ -77,11 +78,6 @@ if not st.session_state.job_running:
             help="Which AI service to use"
         )
         
-        deep_mode = st.checkbox(
-            "🔍 Use Deep Mode (click each profile)",
-            help="Enable if profile links are built dynamically"
-        )
-        
         submitted = st.form_submit_button("🚀 Start Scraping", type="primary", use_container_width=True)
         
         if submitted:
@@ -92,7 +88,6 @@ if not st.session_state.job_running:
                 st.session_state.university = university
                 st.session_state.url = url
                 st.session_state.provider = provider
-                st.session_state.deep_mode = deep_mode
                 st.session_state.records = []
                 st.session_state.error_msg = None
                 st.session_state.success = False
@@ -112,36 +107,36 @@ else:
         progress_container.progress(10)
         status_container.info("🔍 Initializing scraper...")
         
-        fetcher = Fetcher(headless=True, respect_robots=False)
         extractor = get_extractor(st.session_state.provider)
         
         # Fetch page
         progress_container.progress(20)
         status_container.info("📥 Fetching listing page...")
-        page = fetcher.fetch(st.session_state.url)
-        
-        # Deep mode
-        click_links = []
-        if st.session_state.deep_mode:
-            progress_container.progress(40)
-            status_container.info("🖱️ Discovering profile URLs via clicks...")
-            click_links = fetcher.discover_click_targets(st.session_state.url)
-            existing_hrefs = {l["href"] for l in page["links"]}
-            for l in click_links:
-                if l["href"] not in existing_hrefs:
-                    page["links"].append(l)
-                    existing_hrefs.add(l["href"])
+        try:
+            resp = requests.get(st.session_state.url, timeout=10)
+            soup = BeautifulSoup(resp.content, 'html.parser')
+            
+            # Extract text and links
+            for tag in soup(["script", "style", "noscript"]):
+                tag.decompose()
+            
+            text = soup.get_text(separator="\n", strip=True)
+            
+            links = []
+            for a in soup.find_all("a", href=True):
+                href = a["href"]
+                if href.startswith(("http://", "https://")):
+                    links.append({"text": a.get_text(strip=True), "href": href})
+            
+            page = {"url": st.session_state.url, "text": text, "links": links}
+        except Exception as e:
+            raise Exception(f"Failed to fetch page: {e}")
         
         # Analyze page
         progress_container.progress(50)
         status_container.info("🤖 Analyzing page structure...")
         analysis = extractor.analyze_listing_page(page["url"], page["text"], page["links"])
         page_type = analysis.get("page_type")
-        
-        # Override if deep mode found links
-        if st.session_state.deep_mode and click_links and page_type != "detail_links":
-            page_type = "detail_links"
-            analysis = {"page_type": "detail_links", "profiles": click_links}
         
         records = []
         
@@ -173,8 +168,14 @@ else:
                     progress_container.progress(progress)
                     record_count_container.metric("Extracted Records", len(records))
                     
-                    detail_page = fetcher.fetch(purl)
-                    data = extractor.extract_detail_page(purl, detail_page["text"])
+                    # Fetch detail page with requests
+                    resp = requests.get(purl, timeout=10)
+                    soup = BeautifulSoup(resp.content, 'html.parser')
+                    for tag in soup(["script", "style", "noscript"]):
+                        tag.decompose()
+                    detail_text = soup.get_text(separator="\n", strip=True)
+                    
+                    data = extractor.extract_detail_page(purl, detail_text)
                     data["profile_url"] = purl
                     
                     rec = FacultyRecord(
@@ -191,8 +192,6 @@ else:
         
         else:
             raise Exception(f"Could not identify page type: {analysis.get('reason', 'Unknown')}")
-        
-        fetcher.close()
         
         if not records:
             raise Exception("No records extracted from the page.")
@@ -268,11 +267,9 @@ else:
                 height=400
             )
     
-    col1, col2 = st.columns(2)
-    with col1:
-        if st.button("🔄 Start Over", use_container_width=True):
-            st.session_state.job_running = False
-            st.session_state.records = []
-            st.session_state.error_msg = None
-            st.session_state.success = False
-            st.rerun()
+    if st.button("🔄 Start Over", use_container_width=True):
+        st.session_state.job_running = False
+        st.session_state.records = []
+        st.session_state.error_msg = None
+        st.session_state.success = False
+        st.rerun()
