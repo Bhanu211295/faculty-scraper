@@ -1,279 +1,234 @@
 """
-Streamlit web app for faculty scraper - FIXED VERSION
+extractor.py
+------------
+The "brain" of the scraper. Instead of writing CSS selectors per university
+(which breaks the moment a site redesigns), we hand the cleaned page content
+to an LLM and ask it to either:
+  (a) pull full faculty records directly off the page, or
+  (b) tell us this is a listing page and hand back links to individual
+      profile pages so we can go one level deeper.
+
+This is what lets ONE tool work across DTU, an IIT, a random state
+university's 2009-era table layout, etc. -- the model reads the page the
+way a human would, instead of us hard-coding markup assumptions.
+
+Three providers are supported, picked with --provider in scrape.py:
+  - gemini    (free tier: Google AI Studio, no card required)
+  - groq      (free tier: fast open models like Llama/Kimi, no card required)
+  - anthropic (paid API, best structured-extraction quality)
+
+All three implement the same two methods, so scrape.py doesn't care which
+one is behind the scenes.
 """
 
-import streamlit as st
-from io import StringIO
-import csv
-from datetime import datetime
-import requests
-from bs4 import BeautifulSoup
-import urllib3
+import json
+import os
+from abc import ABC, abstractmethod
+from dataclasses import dataclass, asdict
+from typing import Optional
 
-# Suppress SSL warnings
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+# ---------------------------------------------------------------------------
+# Universal schema every university's data gets normalized into.
+# Add fields here if you need more (e.g. "office_location", "orcid_id").
+# ---------------------------------------------------------------------------
+FIELDS = [
+    "name",
+    "designation",       # Professor / Associate Professor / Librarian / etc.
+    "department",
+    "qualification",     # e.g. "Ph.D (IIT Delhi), M.Tech, B.Tech"
+    "specialization",
+    "email",
+    "phone",
+    "photo_url",
+    "bio",
+    "profile_url",
+]
 
-from extractor import get_extractor, FacultyRecord
 
-st.set_page_config(
-    page_title="Faculty Data Scraper",
-    page_icon="📊",
-    layout="centered",
-    initial_sidebar_state="collapsed"
-)
+@dataclass
+class FacultyRecord:
+    source_university: str
+    source_url: str
+    name: Optional[str] = None
+    designation: Optional[str] = None
+    department: Optional[str] = None
+    qualification: Optional[str] = None
+    specialization: Optional[str] = None
+    email: Optional[str] = None
+    phone: Optional[str] = None
+    photo_url: Optional[str] = None
+    bio: Optional[str] = None
+    profile_url: Optional[str] = None
+    extraction_confidence: Optional[str] = None  # "high"/"medium"/"low", model self-reported
 
-st.markdown("""
-<style>
-    .main {
-        max-width: 700px;
-        margin: auto;
-    }
-</style>
-""", unsafe_allow_html=True)
+    def to_dict(self):
+        return asdict(self)
 
-st.title("📊 Faculty Data Scraper")
-st.markdown("Extract faculty information from university websites — no coding required")
 
-# Initialize session state
-if "job_running" not in st.session_state:
-    st.session_state.job_running = False
-if "records" not in st.session_state:
-    st.session_state.records = []
-if "error_msg" not in st.session_state:
-    st.session_state.error_msg = None
-if "success" not in st.session_state:
-    st.session_state.success = False
+# ---------------------------------------------------------------------------
+# Shared prompt-building + JSON parsing. Providers differ only in HOW they
+# send a prompt and get text back -- the prompts themselves stay identical
+# so extraction quality is as consistent as possible across providers.
+# ---------------------------------------------------------------------------
+class BaseExtractor(ABC):
+    def analyze_listing_page(self, url: str, cleaned_text: str, links: list[dict]) -> dict:
+        prompt = self._listing_prompt(url, cleaned_text, links)
+        raw = self._complete(prompt, max_tokens=8192)
+        return self._parse_json(raw)
 
-# Sidebar info
-with st.sidebar:
-    st.markdown("### ℹ️ How it works")
-    st.markdown("""
-    1. Enter university name
-    2. Paste faculty listing URL
-    3. Pick an AI provider
-    4. Click "Start Scraping"
-    5. Download CSV
-    
-    **Free API Keys:**
-    - [Gemini](https://aistudio.google.com/apikey)
-    - [Groq](https://console.groq.com)
-    """)
+    def extract_detail_page(self, url: str, cleaned_text: str) -> dict:
+        prompt = self._detail_prompt(url, cleaned_text)
+        raw = self._complete(prompt, max_tokens=1500)
+        return self._parse_json(raw)
 
-# Form section
-if not st.session_state.job_running:
-    st.markdown("---")
-    
-    with st.form("scrape_form"):
-        university = st.text_input(
-            "University Name *",
-            placeholder="e.g., DTU, IIT Delhi",
-            help="Label for this university"
-        )
-        
-        url = st.text_input(
-            "Faculty Listing URL *",
-            placeholder="https://dtu.ac.in/Web/Departments/Environment/faculty_v2/",
-            help="Main faculty/staff page URL"
-        )
-        
-        provider = st.selectbox(
-            "AI Provider",
-            ["gemini", "groq", "anthropic"],
-            help="Which AI service to use"
-        )
-        
-        submitted = st.form_submit_button("🚀 Start Scraping", type="primary", use_container_width=True)
-        
-        if submitted:
-            if not university or not url:
-                st.error("❌ Please enter both university name and URL")
-            else:
-                st.session_state.job_running = True
-                st.session_state.university = university
-                st.session_state.url = url
-                st.session_state.provider = provider
-                st.session_state.records = []
-                st.session_state.error_msg = None
-                st.session_state.success = False
-                st.rerun()
+    @abstractmethod
+    def _complete(self, prompt: str, max_tokens: int) -> str:
+        """Send prompt to the provider, return raw text response."""
+        raise NotImplementedError
 
-else:
-    # Job running - show progress and results
-    st.markdown("---")
-    st.markdown("### 🔄 Scraping in Progress...")
-    
-    progress_container = st.empty()
-    status_container = st.empty()
-    record_count_container = st.empty()
-    error_container = st.empty()
-    
-    try:
-        progress_container.progress(10)
-        status_container.info("🔍 Initializing scraper...")
-        
-        extractor = get_extractor(st.session_state.provider)
-        
-        # Fetch page
-        progress_container.progress(20)
-        status_container.info("📥 Fetching listing page...")
+    @staticmethod
+    def _listing_prompt(url: str, cleaned_text: str, links: list[dict]) -> str:
+        return f"""You are looking at a university department/faculty page.
+
+URL: {url}
+
+Here is the extracted visible text of the page:
+---
+{cleaned_text[:12000]}
+---
+
+Here are the links found on the page (text -> href), which may include
+navigation, so use judgement:
+---
+{json.dumps(links[:200], indent=2)[:8000]}
+---
+
+Decide which of these is true:
+1. "detail_links" - This is a listing/grid page where each faculty/staff
+   member has a name + a link to their OWN profile/detail page for more info.
+2. "full_records" - This page already shows complete details for each person
+   directly (name, designation, qualification, email, etc.) with no need to
+   click through anywhere else.
+3. "unknown" - This isn't a faculty/staff listing page at all, or you can't
+   tell.
+
+Respond with ONLY valid JSON, no markdown fences, no commentary:
+
+If detail_links:
+{{"page_type": "detail_links", "profiles": [{{"name": "<name if visible, else null>", "url": "<absolute or relative href>"}}, ...]}}
+
+If full_records:
+{{"page_type": "full_records", "records": [{{"name": "...", "designation": "...", "department": "...", "qualification": "...", "specialization": "...", "email": "...", "phone": "...", "photo_url": "...", "bio": "...", "profile_url": null}}, ...]}}
+
+If unknown:
+{{"page_type": "unknown", "reason": "..."}}
+
+Use null for any field you can't find. Do not invent data."""
+
+    @staticmethod
+    def _detail_prompt(url: str, cleaned_text: str) -> str:
+        return f"""Extract structured information about the faculty/staff
+member described on this page.
+
+URL: {url}
+
+Page text:
+---
+{cleaned_text[:12000]}
+---
+
+Respond with ONLY valid JSON, no markdown fences, no commentary, matching
+exactly this shape (use null for anything not present -- do not invent data,
+do not guess a value that isn't actually on the page):
+
+{{"name": "...", "designation": "...", "department": "...", "qualification": "...", "specialization": "...", "email": "...", "phone": "...", "photo_url": "...", "bio": "...", "extraction_confidence": "high|medium|low"}}"""
+
+    @staticmethod
+    def _parse_json(text: str) -> dict:
+        text = text.strip()
+        if text.startswith("```"):
+            text = text.strip("`")
+            if text.startswith("json"):
+                text = text[4:]
         try:
-            resp = requests.get(st.session_state.url, timeout=10, verify=False)
-            soup = BeautifulSoup(resp.content, 'html.parser')
-            
-            # Extract text and links
-            for tag in soup(["script", "style", "noscript"]):
-                tag.decompose()
-            
-            text = soup.get_text(separator="\n", strip=True)
-            
-            links = []
-            for a in soup.find_all("a", href=True):
-                href = a["href"]
-                if href.startswith(("http://", "https://")):
-                    links.append({"text": a.get_text(strip=True), "href": href})
-            
-            page = {"url": st.session_state.url, "text": text, "links": links}
-        except Exception as e:
-            raise Exception(f"Failed to fetch page: {e}")
-        
-        # Analyze page
-        progress_container.progress(50)
-        status_container.info("🤖 Analyzing page structure...")
-        analysis = extractor.analyze_listing_page(page["url"], page["text"], page["links"])
-        page_type = analysis.get("page_type")
-        
-        records = []
-        
-        if page_type == "full_records":
-            # Extract records directly from page
-            progress_container.progress(70)
-            status_container.info("📋 Extracting records from page...")
-            for r in analysis.get("records", []):
-                rec = FacultyRecord(
-                    source_university=st.session_state.university,
-                    source_url=st.session_state.url
-                )
-                for k in ["name", "designation", "department", "qualification", "specialization", "email", "phone", "photo_url", "bio"]:
-                    setattr(rec, k, r.get(k))
-                records.append(rec)
-        
-        elif page_type == "detail_links":
-            # Visit individual profiles
-            profiles = analysis.get("profiles", [])
-            status_container.info(f"👤 Visiting {len(profiles)} profile pages...")
-            
-            for i, p in enumerate(profiles, 1):
-                purl = p.get("url")
-                if not purl:
-                    continue
-                
-                try:
-                    progress = 70 + int((i / len(profiles)) * 25)
-                    progress_container.progress(progress)
-                    record_count_container.metric("Extracted Records", len(records))
-                    
-                    # Fetch detail page with requests
-                    resp = requests.get(purl, timeout=10, verify=False)
-                    soup = BeautifulSoup(resp.content, 'html.parser')
-                    for tag in soup(["script", "style", "noscript"]):
-                        tag.decompose()
-                    detail_text = soup.get_text(separator="\n", strip=True)
-                    
-                    data = extractor.extract_detail_page(purl, detail_text)
-                    data["profile_url"] = purl
-                    
-                    rec = FacultyRecord(
-                        source_university=st.session_state.university,
-                        source_url=st.session_state.url
-                    )
-                    for k in ["name", "designation", "department", "qualification", "specialization", "email", "phone", "photo_url", "bio", "profile_url"]:
-                        setattr(rec, k, data.get(k))
-                    rec.extraction_confidence = data.get("extraction_confidence")
-                    records.append(rec)
-                
-                except Exception as e:
-                    pass  # Skip this profile and move on
-        
-        else:
-            raise Exception(f"Could not identify page type: {analysis.get('reason', 'Unknown')}")
-        
-        if not records:
-            raise Exception("No records extracted from the page.")
-        
-        # Deduplicate
-        seen = {}
-        deduped = []
-        for r in records:
-            key = (r.name, r.email)
-            if key not in seen:
-                seen[key] = True
-                deduped.append(r)
-        
-        st.session_state.records = deduped
-        st.session_state.success = True
-        progress_container.progress(100)
-        status_container.success(f"✅ Success! Extracted {len(deduped)} records.")
-    
-    except Exception as e:
-        st.session_state.error_msg = str(e)
-        error_container.error(f"❌ Error: {str(e)}")
-        status_container.empty()
-        progress_container.empty()
-    
-    st.markdown("---")
-    
-    # Show results or error
-    if st.session_state.success and st.session_state.records:
-        st.success(f"✅ Extracted {len(st.session_state.records)} faculty records!")
-        
-        st.markdown("### 📥 Download Your Data")
-        
-        # Convert to CSV
-        output = StringIO()
-        fieldnames = [
-            "source_university",
-            "source_url",
-            "name",
-            "designation",
-            "department",
-            "qualification",
-            "specialization",
-            "email",
-            "phone",
-            "photo_url",
-            "bio",
-            "profile_url",
-            "extraction_confidence",
-        ]
-        writer = csv.DictWriter(output, fieldnames=fieldnames)
-        writer.writeheader()
-        writer.writerows([r.to_dict() for r in st.session_state.records])
-        
-        csv_data = output.getvalue()
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        
-        st.download_button(
-            label="📥 Download CSV",
-            data=csv_data,
-            file_name=f"faculty_data_{timestamp}.csv",
-            mime="text/csv",
-            type="primary",
-            use_container_width=True
+            return json.loads(text)
+        except json.JSONDecodeError:
+            # last-ditch: find the outermost { ... }
+            start, end = text.find("{"), text.rfind("}")
+            if start != -1 and end != -1:
+                return json.loads(text[start:end + 1])
+            raise
+
+
+# ---------------------------------------------------------------------------
+# Gemini (free tier via Google AI Studio -- aistudio.google.com/apikey,
+# no card required). Generous free daily quota, large context window,
+# solid structured JSON output.
+# ---------------------------------------------------------------------------
+class GeminiExtractor(BaseExtractor):
+    def __init__(self, api_key: Optional[str] = None, model: str = "gemini-3.6-flash"):
+        from google import genai
+        self.client = genai.Client(api_key=api_key or os.environ.get("GEMINI_API_KEY"))
+        self.model = model
+
+    def _complete(self, prompt: str, max_tokens: int) -> str:
+        resp = self.client.models.generate_content(
+            model=self.model,
+            contents=prompt,
+            config={
+                "max_output_tokens": max_tokens,
+                "response_mime_type": "application/json",
+            },
         )
-        
-        st.markdown("---")
-        
-        # Preview
-        with st.expander("👀 Preview Data"):
-            st.dataframe(
-                [r.to_dict() for r in st.session_state.records[:10]],
-                use_container_width=True,
-                height=400
-            )
-    
-    if st.button("🔄 Start Over", use_container_width=True):
-        st.session_state.job_running = False
-        st.session_state.records = []
-        st.session_state.error_msg = None
-        st.session_state.success = False
-        st.rerun()
+        return resp.text
+
+
+# ---------------------------------------------------------------------------
+# Groq (free tier via console.groq.com -- no card required). Very fast,
+# runs open models (Llama, Kimi, etc). Slightly less reliable at strict
+# JSON formatting than Gemini/Claude, so we lean on _parse_json's fallback.
+# ---------------------------------------------------------------------------
+class GroqExtractor(BaseExtractor):
+    def __init__(self, api_key: Optional[str] = None, model: str = "llama-3.3-70b-versatile"):
+        from groq import Groq
+        self.client = Groq(api_key=api_key or os.environ.get("GROQ_API_KEY"))
+        self.model = model
+
+    def _complete(self, prompt: str, max_tokens: int) -> str:
+        resp = self.client.chat.completions.create(
+            model=self.model,
+            max_tokens=max_tokens,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        return resp.choices[0].message.content
+
+
+# ---------------------------------------------------------------------------
+# Anthropic (paid API -- kept as an option since it's the highest-quality
+# extractor, in case you want to switch back once you're past prototyping).
+# ---------------------------------------------------------------------------
+class AnthropicExtractor(BaseExtractor):
+    def __init__(self, api_key: Optional[str] = None, model: str = "claude-sonnet-5"):
+        from anthropic import Anthropic
+        self.client = Anthropic(api_key=api_key or os.environ.get("ANTHROPIC_API_KEY"))
+        self.model = model
+
+    def _complete(self, prompt: str, max_tokens: int) -> str:
+        resp = self.client.messages.create(
+            model=self.model,
+            max_tokens=max_tokens,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        return resp.content[0].text
+
+
+def get_extractor(provider: str, model: Optional[str] = None) -> BaseExtractor:
+    """Factory -- scrape.py calls this so it doesn't need to know provider details."""
+    provider = provider.lower()
+    if provider == "gemini":
+        return GeminiExtractor(model=model) if model else GeminiExtractor()
+    if provider == "groq":
+        return GroqExtractor(model=model) if model else GroqExtractor()
+    if provider == "anthropic":
+        return AnthropicExtractor(model=model) if model else AnthropicExtractor()
+    raise ValueError(f"Unknown provider: {provider!r}. Choose gemini, groq, or anthropic.")
