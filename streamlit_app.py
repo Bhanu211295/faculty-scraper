@@ -129,24 +129,24 @@ else:
     record_count_container = st.empty()
     error_container = st.empty()
     
-    def run_scrape():
+    def run_scrape(univ, url_to_scrape, prov, use_deep):
         try:
-            status_container.info(f"🔍 Initializing scraper for {university}...")
+            status_container.info(f"🔍 Initializing scraper for {univ}...")
             
             fetcher = Fetcher(headless=True, respect_robots=False)
-            extractor = get_extractor(provider)
+            extractor = get_extractor(prov)
             
             try:
                 # Fetch the page
                 status_container.info("📥 Fetching listing page...")
                 progress_container.progress(20)
-                page = fetcher.fetch(url)
+                page = fetcher.fetch(url_to_scrape)
                 
                 # Deep mode: click to discover URLs
-                if deep_mode:
+                if use_deep:
                     status_container.info("🖱️ Discovering profile URLs via clicks...")
                     progress_container.progress(40)
-                    click_links = fetcher.discover_click_targets(url)
+                    click_links = fetcher.discover_click_targets(url_to_scrape)
                     existing_hrefs = {l["href"] for l in page["links"]}
                     for l in click_links:
                         if l["href"] not in existing_hrefs:
@@ -160,7 +160,7 @@ else:
                 page_type = analysis.get("page_type")
                 
                 # Override if deep mode found links
-                if deep_mode and click_links and page_type != "detail_links":
+                if use_deep and click_links and page_type != "detail_links":
                     page_type = "detail_links"
                     analysis = {"page_type": "detail_links", "profiles": click_links}
                 
@@ -171,7 +171,7 @@ else:
                     status_container.info("📋 Extracting records from page...")
                     progress_container.progress(70)
                     for r in analysis.get("records", []):
-                        rec = FacultyRecord(source_university=university, source_url=url)
+                        rec = FacultyRecord(source_university=univ, source_url=url_to_scrape)
                         for k in ["name", "designation", "department", "qualification", "specialization", "email", "phone", "photo_url", "bio"]:
                             setattr(rec, k, r.get(k))
                         records.append(rec)
@@ -193,7 +193,7 @@ else:
                             detail_page = fetcher.fetch(purl)
                             data = extractor.extract_detail_page(purl, detail_page["text"])
                             data["profile_url"] = purl
-                            rec = FacultyRecord(source_university=university, source_url=url)
+                            rec = FacultyRecord(source_university=univ, source_url=url_to_scrape)
                             for k in ["name", "designation", "department", "qualification", "specialization", "email", "phone", "photo_url", "bio", "profile_url"]:
                                 setattr(rec, k, data.get(k))
                             rec.extraction_confidence = data.get("extraction_confidence")
@@ -234,7 +234,7 @@ else:
             progress_container.empty()
     
     # Run the scrape
-    run_scrape()
+    run_scrape(university, url, provider, deep_mode)
     
     st.markdown("---")
     
