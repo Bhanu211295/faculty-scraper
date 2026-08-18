@@ -8,6 +8,10 @@ import csv
 from datetime import datetime
 import requests
 from bs4 import BeautifulSoup
+import urllib3
+
+# Suppress SSL warnings
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 from extractor import get_extractor, FacultyRecord
 
@@ -113,7 +117,7 @@ else:
         progress_container.progress(20)
         status_container.info("📥 Fetching listing page...")
         try:
-            resp = requests.get(st.session_state.url, timeout=10)
+            resp = requests.get(st.session_state.url, timeout=10, verify=False)
             soup = BeautifulSoup(resp.content, 'html.parser')
             
             # Extract text and links
@@ -169,7 +173,7 @@ else:
                     record_count_container.metric("Extracted Records", len(records))
                     
                     # Fetch detail page with requests
-                    resp = requests.get(purl, timeout=10)
+                    resp = requests.get(purl, timeout=10, verify=False)
                     soup = BeautifulSoup(resp.content, 'html.parser')
                     for tag in soup(["script", "style", "noscript"]):
                         tag.decompose()
