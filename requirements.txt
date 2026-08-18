@@ -4,9 +4,12 @@ groq>=0.11.0              # Groq (free tier, fast)
 anthropic>=0.40.0         # Anthropic Claude (paid, best quality)
 
 # Web scraping and parsing
-playwright>=1.45.0
 beautifulsoup4>=4.12.0
+requests>=2.31.0
 pandas>=2.0.0
+
+# Note: Playwright removed for Streamlit Cloud compatibility
+# Use it locally with: playwright>=1.45.0
 
 # Web frameworks
 flask>=3.0.0
