@@ -142,6 +142,9 @@ else:
                 progress_container.progress(20)
                 page = fetcher.fetch(url_to_scrape)
                 
+                # Initialize click_links (will be populated if deep_mode is on)
+                click_links = []
+                
                 # Deep mode: click to discover URLs
                 if use_deep:
                     status_container.info("🖱️ Discovering profile URLs via clicks...")
