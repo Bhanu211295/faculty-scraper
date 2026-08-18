@@ -166,7 +166,7 @@ do not guess a value that isn't actually on the page):
 # solid structured JSON output.
 # ---------------------------------------------------------------------------
 class GeminiExtractor(BaseExtractor):
-    def __init__(self, api_key: Optional[str] = None, model: str = "gemini-2.5-flash"):
+       def __init__(self, api_key: Optional[str] = None, model: str = "gemini-3.6-flash"):
         from google import genai
         self.client = genai.Client(api_key=api_key or os.environ.get("GEMINI_API_KEY"))
         self.model = model
