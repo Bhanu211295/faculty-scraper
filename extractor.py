@@ -189,7 +189,7 @@ class GeminiExtractor(BaseExtractor):
 # JSON formatting than Gemini/Claude, so we lean on _parse_json's fallback.
 # ---------------------------------------------------------------------------
 class GroqExtractor(BaseExtractor):
-    def __init__(self, api_key: Optional[str] = None, model: str = "llama-3.3-70b-versatile"):
+    def __init__(self, api_key: Optional[str] = None, model: str = "mixtral-8x7b-32768"):
         from groq import Groq
         self.client = Groq(api_key=api_key or os.environ.get("GROQ_API_KEY"))
         self.model = model
